@@ -12,6 +12,7 @@ Funcionamiento:
     últimos X segundos.
 """
 
+import configparser
 import math
 import os
 import shutil
@@ -29,14 +30,41 @@ from tkinter import ttk
 IS_WINDOWS = sys.platform == "win32"
 
 SEG_SECONDS = 1
-DEFAULT_SECONDS = 30
 MAX_SECONDS = 30
-DEFAULT_FPS = 30
-OUTPUT_DIR = Path(os.environ.get("SCREENREC_DIR", Path.home() / "Videos" / "ScreenRec"))
-# Windows: "gdigrab" (todos los monitores, por defecto) o "ddagrab" (Desktop
-# Duplication: más eficiente, pero sólo un monitor, SCREENREC_MONITOR=0,1,…)
-CAPTURE = os.environ.get("SCREENREC_CAPTURE", "gdigrab").strip().lower()
-MONITOR = int(os.environ.get("SCREENREC_MONITOR", "0"))
+CONFIG_PATH = Path(__file__).resolve().with_name("config.ini")
+DEFAULT_OUTPUT_DIR = Path.home() / "Videos" / "ScreenRec"
+
+CONFIG_TEMPLATE = """\
+# Configuración de ScreenRec. Se crea automáticamente la primera vez que se ejecuta.
+# Si un valor no es válido se usa el valor por defecto (y se anota en screenrec.log).
+
+[screenrec]
+# Carpeta donde se guardan los clips (admite ~ y variables como %USERPROFILE%).
+# Vacío = {default_dir}
+carpeta_salida = {carpeta_salida}
+
+# Segundos que se guardan al pulsar el botón (1-{max_seconds}). También se cambia desde la ventana.
+segundos = {segundos}
+
+# Fotogramas por segundo de la grabación (5-60). Bajarlo reduce el uso de CPU.
+fps = {fps}
+
+# Sólo Windows. Modo de captura:
+#   gdigrab = todos los monitores (por defecto)
+#   ddagrab = más eficiente y mejor con vídeo acelerado por GPU, pero un solo monitor
+captura_windows = {captura_windows}
+
+# Sólo con ddagrab: monitor a grabar (0 = principal, 1 = segundo, ...)
+monitor = {monitor}
+"""
+
+DEFAULT_CONFIG = {
+    "carpeta_salida": "",
+    "segundos": 30,
+    "fps": 30,
+    "captura_windows": "gdigrab",
+    "monitor": 0,
+}
 
 # Evita que se abra una consola por cada ffmpeg en Windows
 POPEN_FLAGS = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WINDOWS else {}
@@ -51,6 +79,60 @@ def find_ffmpeg():
         return imageio_ffmpeg.get_ffmpeg_exe()
     except ImportError:
         sys.exit("No se encuentra ffmpeg. Instálalo o ejecuta: pip install imageio-ffmpeg")
+
+
+def load_config(path=CONFIG_PATH):
+    """Lee config.ini (creándolo con los valores por defecto si no existe).
+    Devuelve (config, avisos) con los valores ya validados."""
+    if not path.exists():
+        save_config(DEFAULT_CONFIG, path)
+
+    parser = configparser.ConfigParser(interpolation=None)
+    warnings = []
+    try:
+        parser.read(path, encoding="utf-8")
+    except configparser.Error as e:
+        warnings.append(f"No se pudo leer {path.name}: {e}. Se usan los valores por defecto.")
+    section = parser["screenrec"] if parser.has_section("screenrec") else {}
+
+    def get_int(key, lo, hi):
+        raw = section.get(key, str(DEFAULT_CONFIG[key])).strip()
+        try:
+            value = int(raw)
+            if lo <= value <= hi:
+                return value
+        except ValueError:
+            pass
+        warnings.append(f"{path.name}: '{key} = {raw}' no es válido ({lo}-{hi}); "
+                        f"se usa {DEFAULT_CONFIG[key]}.")
+        return DEFAULT_CONFIG[key]
+
+    capture = section.get("captura_windows", DEFAULT_CONFIG["captura_windows"]).strip().lower()
+    if capture not in ("gdigrab", "ddagrab"):
+        warnings.append(f"{path.name}: 'captura_windows = {capture}' no es válido "
+                        "(gdigrab o ddagrab); se usa gdigrab.")
+        capture = DEFAULT_CONFIG["captura_windows"]
+
+    config = {
+        "carpeta_salida": section.get("carpeta_salida", "").strip(),
+        "segundos": get_int("segundos", 1, MAX_SECONDS),
+        "fps": get_int("fps", 5, 60),
+        "captura_windows": capture,
+        "monitor": get_int("monitor", 0, 16),
+    }
+    return config, warnings
+
+
+def save_config(config, path=CONFIG_PATH):
+    try:
+        path.write_text(CONFIG_TEMPLATE.format(
+            default_dir=DEFAULT_OUTPUT_DIR, max_seconds=MAX_SECONDS, **config), encoding="utf-8")
+    except OSError as e:
+        print(f"No se pudo guardar {path}: {e}", file=sys.stderr)
+
+
+CONFIG, CONFIG_WARNINGS = load_config()
+OUTPUT_DIR = Path(os.path.expandvars(CONFIG["carpeta_salida"])).expanduser() if CONFIG["carpeta_salida"] else DEFAULT_OUTPUT_DIR
 
 
 def log_error(msg):
@@ -82,9 +164,9 @@ def enable_dpi_awareness():
 def capture_input_args(fps, width, height):
     """Argumentos de entrada de ffmpeg según la plataforma."""
     if IS_WINDOWS:
-        if CAPTURE == "ddagrab":
+        if CONFIG["captura_windows"] == "ddagrab":
             return ["-f", "lavfi", "-i",
-                    f"ddagrab=output_idx={MONITOR}:framerate={fps}:draw_mouse=1,"
+                    f"ddagrab=output_idx={CONFIG['monitor']}:framerate={fps}:draw_mouse=1,"
                     "hwdownload,format=bgra"]
         return ["-f", "gdigrab", "-framerate", str(fps), "-draw_mouse", "1", "-i", "desktop"]
     display = os.environ.get("DISPLAY", ":0")
@@ -186,7 +268,7 @@ class App:
         self.root = root
         self.ffmpeg = find_ffmpeg()
         w, h = root.winfo_screenwidth(), root.winfo_screenheight()
-        self.recorder = Recorder(self.ffmpeg, w - w % 2, h - h % 2, DEFAULT_FPS, MAX_SECONDS)
+        self.recorder = Recorder(self.ffmpeg, w - w % 2, h - h % 2, CONFIG["fps"], MAX_SECONDS)
         self.saving = False
         self.closing = False
 
@@ -206,7 +288,7 @@ class App:
         self.button.grid(row=0, column=0, columnspan=3, sticky="ew")
 
         ttk.Label(frame, text="Últimos").grid(row=1, column=0, pady=(6, 0))
-        self.seconds = tk.IntVar(value=DEFAULT_SECONDS)
+        self.seconds = tk.IntVar(value=CONFIG["segundos"])
         ttk.Spinbox(frame, from_=1, to=MAX_SECONDS, width=5, textvariable=self.seconds).grid(
             row=1, column=1, pady=(6, 0))
         ttk.Label(frame, text="s").grid(row=1, column=2, pady=(6, 0), sticky="w")
@@ -241,13 +323,21 @@ class App:
         try:
             return max(1, min(MAX_SECONDS, int(self.seconds.get())))
         except (tk.TclError, ValueError):
-            return DEFAULT_SECONDS
+            return CONFIG["segundos"]
+
+    def remember_seconds(self):
+        """Guarda en config.ini los segundos elegidos en la ventana."""
+        seconds = self.get_seconds()
+        if seconds != CONFIG["segundos"]:
+            CONFIG["segundos"] = seconds
+            save_config(CONFIG)
 
     def save(self):
         if self.saving:
             return
         self.saving = True
         seconds = self.get_seconds()
+        self.remember_seconds()
         self.button.config(state="disabled")
         self.status.config(text="Guardando…")
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -279,6 +369,7 @@ class App:
         if self.closing:
             return
         self.closing = True
+        self.remember_seconds()
         self.recorder.stop()
         self.root.destroy()
 
@@ -286,6 +377,8 @@ class App:
 def main():
     if os.environ.get("XDG_SESSION_TYPE") == "wayland":
         print("Aviso: sesión Wayland detectada; x11grab sólo funciona en sesiones X11.", file=sys.stderr)
+    for warning in CONFIG_WARNINGS:
+        log_error(warning)
     enable_dpi_awareness()
     root = tk.Tk()
     app = App(root)
